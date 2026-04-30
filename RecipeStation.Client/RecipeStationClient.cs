@@ -8,12 +8,14 @@ namespace RecipeStation.Client;
 public sealed class RecipeStationClient : IRecipeStationClient
 {
     #region Events
-    public event EventHandler<string>?                    LogMessage;
-    public event EventHandler<ushort>?                    AcknowledgeReceived;
-    public event EventHandler<ushort>?                    RecipeCopiedReceived;
-    public event EventHandler<ushort>?                    RecipeDeletedReceived;
-    public event EventHandler<(ushort seq, int quantity)>? RecipeQuantityReceived;
-    public event EventHandler<ushort>?                    CommandFailedReceived;
+    public event EventHandler<string>?                                            LogMessage;
+    public event EventHandler<ushort>?                                            AcknowledgeReceived;
+    public event EventHandler<ushort>?                                            RecipeCopiedReceived;
+    public event EventHandler<ushort>?                                            RecipeDeletedReceived;
+    public event EventHandler<(ushort seq, int quantity, int recipeType)>?        RecipeQuantityReceived;
+    public event EventHandler<(ushort seq, int index, string name, int recipeType)>?  RecipeNameReceived;
+    public event EventHandler<(ushort seq, List<string> names, int recipeType)>?     AllRecipeNamesReceived;
+    public event EventHandler<ushort>?                                               CommandFailedReceived;
     #endregion
 
     private enum WaitState { NewMessage, WaitingForAck }
@@ -39,6 +41,11 @@ public sealed class RecipeStationClient : IRecipeStationClient
     private volatile bool _online;
     private ushort _seq;
     private bool   _disposed;
+
+    // "Get all recipes" orchestration state (touched only by main thread to start, receive thread to progress)
+    private int           _getAllRecipeType;
+    private int           _getAllExpectedCount;
+    private List<string>? _getAllCollected;
 
     public string StationName { get; }
     public bool   IsOnline    { get { lock (_stateLock) return _online; } }
@@ -82,7 +89,6 @@ public sealed class RecipeStationClient : IRecipeStationClient
     {
         lock (_stateLock)
         {
-
             if (!_online) return;
             lock (_outQueue)
             {
@@ -113,8 +119,42 @@ public sealed class RecipeStationClient : IRecipeStationClient
         Enqueue(tag);
     }
 
-    public void SendGetRecipeQuantity()
-        => Enqueue(new BerAppPrimitive(StationMsgTagNumbers.GetRecipeQuantity));
+    public void SendGetRecipeQuantity(int recipeType = 0)
+    {
+        if (recipeType == 0)
+        {
+            Enqueue(new BerAppPrimitive(StationMsgTagNumbers.GetRecipeQuantity));
+        }
+        else
+        {
+            var tag     = new BerAppConstructed(StationMsgTagNumbers.GetRecipeQuantity);
+            var typeTag = new BerAppConstructed(StationMsgTagNumbers.RecipeTypeTag);
+            typeTag.Add(new BerInteger(recipeType));
+            tag.Add(typeTag);
+            Enqueue(tag);
+        }
+    }
+
+    public void SendGetRecipeName(int index, int recipeType = 0)
+    {
+        var tag = new BerAppConstructed(StationMsgTagNumbers.GetRecipeName);
+        tag.Add(new BerInteger(index));
+        if (recipeType != 0)
+        {
+            var typeTag = new BerAppConstructed(StationMsgTagNumbers.RecipeTypeTag);
+            typeTag.Add(new BerInteger(recipeType));
+            tag.Add(typeTag);
+        }
+        Enqueue(tag);
+    }
+
+    public void SendGetAllRecipeNames(int recipeType = 0)
+    {
+        _getAllRecipeType     = recipeType;
+        _getAllExpectedCount  = 0;
+        _getAllCollected      = [];
+        SendGetRecipeQuantity(recipeType);
+    }
 
     public void Dispose()
     {
@@ -137,7 +177,6 @@ public sealed class RecipeStationClient : IRecipeStationClient
     {
         var state = WaitState.NewMessage;
         UdpMsg? lastSent = null;
-        
         int resend = 0;
 
         while (_online)
@@ -279,17 +318,14 @@ public sealed class RecipeStationClient : IRecipeStationClient
     {
         if (msg.Tag is BerAppConstructed tag)
         {
-            if (tag.Identifier.TagNumber == StationMsgTagNumbers.SendRecipeQuantity)
+            switch (tag.Identifier.TagNumber)
             {
-                for (int i = 0; i < tag.Count; i++)
-                {
-                    if (tag[i] is BerInteger b)
-                    {
-                        Log($"<< Recipe Quantity: {b.Value}");
-                        RecipeQuantityReceived?.Invoke(this, (msg.SequenceNumber, b.Value));
-                        return;
-                    }
-                }
+                case StationMsgTagNumbers.SendRecipeQuantity:
+                    TranslateSendRecipeQuantity(msg.SequenceNumber, tag);
+                    return;
+                case StationMsgTagNumbers.SendRecipeName:
+                    TranslateSendRecipeName(msg.SequenceNumber, tag);
+                    return;
             }
         }
         else if (msg.Tag is BerAppPrimitive)
@@ -308,6 +344,67 @@ public sealed class RecipeStationClient : IRecipeStationClient
                     Log($"<< Recipe Deleted SEQ:{msg.SequenceNumber:X4}");
                     RecipeDeletedReceived?.Invoke(this, msg.SequenceNumber);
                     break;
+            }
+        }
+    }
+
+    private void TranslateSendRecipeQuantity(ushort seq, BerAppConstructed tag)
+    {
+        int quantity   = 0;
+        int recipeType = 0;
+        for (int i = 0; i < tag.Count; i++)
+        {
+            if (tag[i] is BerInteger b)
+                quantity = b.Value;
+            else if (tag[i].Identifier.TagNumber == StationMsgTagNumbers.RecipeTypeTag
+                     && tag[i] is BerAppConstructed rt && rt.Count > 0 && rt[0] is BerInteger rtVal)
+                recipeType = rtVal.Value;
+        }
+        Log($"<< Recipe Quantity: {quantity} (type:{recipeType})");
+        RecipeQuantityReceived?.Invoke(this, (seq, quantity, recipeType));
+
+        if (_getAllCollected != null && recipeType == _getAllRecipeType)
+        {
+            _getAllExpectedCount = quantity;
+            if (quantity == 0)
+            {
+                AllRecipeNamesReceived?.Invoke(this, (seq, [], recipeType));
+                _getAllCollected = null;
+            }
+            else
+            {
+                SendGetRecipeName(0, recipeType);
+            }
+        }
+    }
+
+    private void TranslateSendRecipeName(ushort seq, BerAppConstructed tag)
+    {
+        int    index      = 0;
+        string name       = string.Empty;
+        int    recipeType = 0;
+        for (int i = 0; i < tag.Count; i++)
+        {
+            if (tag[i] is BerInteger b)
+                index = b.Value;
+            else if (tag[i] is BerVisibleString s)
+                name = s.Value;
+            else if (tag[i].Identifier.TagNumber == StationMsgTagNumbers.RecipeTypeTag
+                     && tag[i] is BerAppConstructed rt && rt.Count > 0 && rt[0] is BerInteger rtVal)
+                recipeType = rtVal.Value;
+        }
+        Log($"<< Recipe Name [{index}]: \"{name}\" (type:{recipeType})");
+        RecipeNameReceived?.Invoke(this, (seq, index, name, recipeType));
+
+        if (_getAllCollected != null && recipeType == _getAllRecipeType)
+        {
+            _getAllCollected.Add(name);
+            if (_getAllCollected.Count < _getAllExpectedCount)
+                SendGetRecipeName(_getAllCollected.Count, recipeType);
+            else
+            {
+                AllRecipeNamesReceived?.Invoke(this, (seq, new List<string>(_getAllCollected), recipeType));
+                _getAllCollected = null;
             }
         }
     }

@@ -7,12 +7,20 @@ var config = new ConfigurationBuilder()
     .AddJsonFile("appsettings.json", optional: false)
     .Build();
 
-var stationConfigs = config.GetSection("Stations").Get<List<RecipeStationConfig>>()
-    ?? throw new InvalidOperationException("No stations found in appsettings.json");
+var pcConfigs = config.GetSection("PCs").Get<List<PcConfig>>()
+    ?? throw new InvalidOperationException("No PCs found in appsettings.json");
 
-Console.WriteLine($"Loaded {stationConfigs.Count} station(s) from configuration:");
-foreach (var s in stationConfigs)
-    Console.WriteLine($"  {s.StationName}  {s.RemoteIP}  recv:{s.LocalRecvPort}  send:{s.LocalSendPort}");
+var stationConfigs = pcConfigs
+    .SelectMany(pc => pc.Stations.Select(s => s.ToRecipeStationConfig(pc.IP)))
+    .ToList();
+
+Console.WriteLine($"Loaded {pcConfigs.Count} PC(s), {stationConfigs.Count} station(s) from configuration:");
+foreach (var pc in pcConfigs)
+{
+    Console.WriteLine($"  [{pc.PcName}]  {pc.IP}");
+    foreach (var s in pc.Stations)
+        Console.WriteLine($"    {s.StationName}  recv:{s.LocalRecvPort}  send:{s.LocalSendPort}");
+}
 
 // ── Build hub and subscribe to events ───────────────────────────────────────
 using var hub = new RecipeStationHub(stationConfigs);
@@ -20,16 +28,23 @@ using var hub = new RecipeStationHub(stationConfigs);
 foreach (var client in hub.Clients)
 {
     var name = client.StationName;
-    client.LogMessage            += (_, msg) => Console.WriteLine($"[{name}] {msg}");
-    client.RecipeCopiedReceived  += (_, seq) => Console.WriteLine($"[{name}] Recipe copied  SEQ:{seq:X4}");
-    client.RecipeDeletedReceived += (_, seq) => Console.WriteLine($"[{name}] Recipe deleted SEQ:{seq:X4}");
-    client.RecipeQuantityReceived += (_, e)  => Console.WriteLine($"[{name}] Recipe qty: {e.quantity}");
-    client.CommandFailedReceived += (_, seq) => Console.WriteLine($"[{name}] Command failed SEQ:{seq:X4}");
+    client.LogMessage             += (_, msg) => Console.WriteLine($"[{name}] {msg}");
+    client.RecipeCopiedReceived   += (_, seq) => Console.WriteLine($"[{name}] Recipe copied  SEQ:{seq:X4}");
+    client.RecipeDeletedReceived  += (_, seq) => Console.WriteLine($"[{name}] Recipe deleted SEQ:{seq:X4}");
+    client.RecipeQuantityReceived += (_, e)   => Console.WriteLine($"[{name}] Recipe qty: {e.quantity} (type:{e.recipeType})");
+    client.RecipeNameReceived     += (_, e)   => Console.WriteLine($"[{name}] Recipe [{e.index}]: \"{e.name}\" (type:{e.recipeType})");
+    client.AllRecipeNamesReceived += (_, e)   =>
+    {
+        Console.WriteLine($"[{name}] All recipes (type:{e.recipeType}, count:{e.names.Count}):");
+        for (int i = 0; i < e.names.Count; i++)
+            Console.WriteLine($"[{name}]   [{i}] {e.names[i]}");
+    };
+    client.CommandFailedReceived  += (_, seq) => Console.WriteLine($"[{name}] Command failed SEQ:{seq:X4}");
 }
 
 // ── Go online ────────────────────────────────────────────────────────────────
 hub.GoOnlineAll();
-Console.WriteLine("\nAll stations online. Commands: ping <name> | copy <name> <src> <dst> | delete <name> <recipe> | count <name> | quit\n");
+Console.WriteLine("\nAll stations online. Commands: ping <name> | copy <name> <src> <dst> | delete <name> <recipe> | count <name> [type] | getrecipe <name> <index> [type] | allrecipes <name> [type] | quit\n");
 
 // ── Command loop ─────────────────────────────────────────────────────────────
 while (true)
@@ -64,8 +79,28 @@ while (true)
             station.SendDeleteRecipe(parts[2]);
             break;
         case "count":
-            station.SendGetRecipeQuantity();
+        {
+            int recipeType = parts.Length >= 3 && int.TryParse(parts[2], out var rt) ? rt : 0;
+            station.SendGetRecipeQuantity(recipeType);
             break;
+        }
+        case "getrecipe" when parts.Length >= 3:
+        {
+            if (!int.TryParse(parts[2], out int idx))
+            {
+                Console.WriteLine("Usage: getrecipe <stationName> <index> [type]");
+                break;
+            }
+            int recipeType = parts.Length >= 4 && int.TryParse(parts[3], out var rt) ? rt : 0;
+            station.SendGetRecipeName(idx, recipeType);
+            break;
+        }
+        case "allrecipes":
+        {
+            int recipeType = parts.Length >= 3 && int.TryParse(parts[2], out var rt) ? rt : 0;
+            station.SendGetAllRecipeNames(recipeType);
+            break;
+        }
         default:
             Console.WriteLine("Unknown command or missing arguments.");
             break;
